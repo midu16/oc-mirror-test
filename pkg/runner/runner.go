@@ -75,8 +75,9 @@ func (tr *TestRunner) runStandardTest() error {
 		fmt.Printf("\n╔═══════════════════════════════════════════════════════════════╗\n")
 		fmt.Printf("║  Iteration %d/%d (%s)                                          ║\n", i+1, tr.config.Iterations, map[bool]string{true: "CLEAN", false: "CACHED"}[isCleanRun])
 		fmt.Printf("╚═══════════════════════════════════════════════════════════════╝\n")
-
-		result, err := tr.runIteration(i+1, isCleanRun, "v2")
+		
+		// Standard test uses the base registry URL (no suffix)
+		result, err := tr.runIteration(i+1, isCleanRun, "v2", "")
 		if err != nil {
 			return fmt.Errorf("iteration %d failed: %w", i+1, err)
 		}
@@ -110,7 +111,7 @@ func (tr *TestRunner) runV1V2Comparison() error {
 		isCleanRun := i == 0
 		fmt.Printf("\n[V1] Iteration %d/%d (%s)\n", i+1, tr.config.Iterations, map[bool]string{true: "CLEAN", false: "CACHED"}[isCleanRun])
 		
-		result, err := tr.runIteration(i+1, isCleanRun, "v1")
+		result, err := tr.runIteration(i+1, isCleanRun, "v1", "-v1")
 		if err != nil {
 			return fmt.Errorf("v1 iteration %d failed: %w", i+1, err)
 		}
@@ -134,7 +135,7 @@ func (tr *TestRunner) runV1V2Comparison() error {
 		isCleanRun := i == 0
 		fmt.Printf("\n[V2] Iteration %d/%d (%s)\n", i+1, tr.config.Iterations, map[bool]string{true: "CLEAN", false: "CACHED"}[isCleanRun])
 		
-		result, err := tr.runIteration(i+1, isCleanRun, "v2")
+		result, err := tr.runIteration(i+1, isCleanRun, "v2", "-v2")
 		if err != nil {
 			return fmt.Errorf("v2 iteration %d failed: %w", i+1, err)
 		}
@@ -178,7 +179,7 @@ func (tr *TestRunner) setupDirectories() error {
 	return nil
 }
 
-func (tr *TestRunner) runIteration(iterationNum int, isCleanRun bool, version string) (TestResult, error) {
+func (tr *TestRunner) runIteration(iterationNum int, isCleanRun bool, version string, registrySuffix string) (TestResult, error) {
 	result := TestResult{
 		Iteration:  iterationNum,
 		IsCleanRun: isCleanRun,
@@ -226,7 +227,7 @@ func (tr *TestRunner) runIteration(iterationNum int, isCleanRun bool, version st
 
 	// Run upload phase
 	fmt.Printf("\n  ┌─ Upload Phase (%s) ─────────────────────────────────────────┐\n", version)
-	uploadMetrics, err := tr.runUploadPhase(version)
+	uploadMetrics, err := tr.runUploadPhase(version, registrySuffix)
 	if err != nil {
 		uploadNetworkMonitor.Stop()
 		return result, fmt.Errorf("upload phase failed: %w", err)
@@ -308,6 +309,7 @@ func (tr *TestRunner) runDownloadPhase(isCleanRun bool, version string) (PhaseMe
 	cmd := command.NewOCMirrorCommand()
 	cmd.SetV2(version == "v2")
 	cmd.SetRemoveSignatures(false)
+	cmd.SetSkipTLS(tr.config.SkipTLS)
 	
 	// Use version-specific config file
 	var configFile string
@@ -345,7 +347,7 @@ func (tr *TestRunner) runDownloadPhase(isCleanRun bool, version string) (PhaseMe
 	return metrics, nil
 }
 
-func (tr *TestRunner) runUploadPhase(version string) (PhaseMetrics, error) {
+func (tr *TestRunner) runUploadPhase(version string, registrySuffix string) (PhaseMetrics, error) {
 	metrics := PhaseMetrics{}
 
 	// Create platform config with version-specific API version
@@ -362,8 +364,12 @@ func (tr *TestRunner) runUploadPhase(version string) (PhaseMetrics, error) {
 		return metrics, fmt.Errorf("failed to create platform config: %w", err)
 	}
 
-	// Ensure registry URL has a scheme prefix
+	// Ensure registry URL has a scheme prefix and append suffix if provided
 	registryURL := tr.config.RegistryURL
+	registryURL = strings.TrimRight(registryURL, "/")
+	if registrySuffix != "" {
+		registryURL = registryURL + registrySuffix
+	}
 	if !strings.Contains(registryURL, "://") {
 		// Default to docker:// if no scheme is provided
 		registryURL = "docker://" + registryURL
@@ -372,8 +378,17 @@ func (tr *TestRunner) runUploadPhase(version string) (PhaseMetrics, error) {
 	cmd := command.NewOCMirrorCommand()
 	cmd.SetV2(version == "v2")
 	cmd.SetConfig(platformConfigPath)
-	cmd.SetFrom("file://platform/mirror")
+	
+	if version == "v1" {
+		// v1 uses plain path
+		cmd.SetFrom("platform/mirror")
+	} else {
+		// v2 uses file:// prefix
+		cmd.SetFrom("file://platform/mirror")
+	}
+	
 	cmd.SetOutput(registryURL)
+	cmd.SetSkipTLS(tr.config.SkipTLS)
 
 	startTime := time.Now()
 	output, err := cmd.Execute()
@@ -404,6 +419,14 @@ func (tr *TestRunner) prepareUploadMirror(version string) error {
 		sourceDir = "mirror/operators-v2"
 	}
 	targetDir := "platform/mirror"
+
+	// Remove target directory first to avoid nesting if it exists
+	if err := os.RemoveAll(targetDir); err != nil {
+		return fmt.Errorf("failed to clean target directory: %w", err)
+	}
+	// Recreate target directory will be handled by cp or we can just let cp do it if we copy contents
+	// But since we want to use cp -r source target, we want target to be the copy of source
+	// So we just run cp -r source target
 
 	// Use cp command to copy directory
 	cmd := exec.Command("cp", "-r", sourceDir, targetDir)
@@ -467,19 +490,27 @@ func (tr *TestRunner) compareCleanVsCached() {
 
 	fmt.Printf("║  Download Time:                                                 ║\n")
 	fmt.Printf("║    Clean:  %-52v ║\n", cleanResult.DownloadPhase.WallTime)
-	fmt.Printf("║    Cached: %-52v ║\n", avgCachedDownloadTime)
-	if avgCachedDownloadTime > 0 {
-		improvement := float64(cleanResult.DownloadPhase.WallTime-avgCachedDownloadTime) / float64(cleanResult.DownloadPhase.WallTime) * 100
-		fmt.Printf("║    Improvement: %-46.2f%% ║\n", improvement)
+	if len(cachedResults) > 0 {
+		fmt.Printf("║    Cached: %-52v ║\n", avgCachedDownloadTime)
+		if avgCachedDownloadTime > 0 {
+			improvement := float64(cleanResult.DownloadPhase.WallTime-avgCachedDownloadTime) / float64(cleanResult.DownloadPhase.WallTime) * 100
+			fmt.Printf("║    Improvement: %-46.2f%% ║\n", improvement)
+		}
+	} else {
+		fmt.Printf("║    Cached: %-52s ║\n", "N/A")
 	}
 
 	fmt.Printf("║                                                                ║\n")
 	fmt.Printf("║  Upload Time:                                                   ║\n")
 	fmt.Printf("║    Clean:  %-52v ║\n", cleanResult.UploadPhase.WallTime)
-	fmt.Printf("║    Cached: %-52v ║\n", avgCachedUploadTime)
-	if avgCachedUploadTime > 0 {
-		improvement := float64(cleanResult.UploadPhase.WallTime-avgCachedUploadTime) / float64(cleanResult.UploadPhase.WallTime) * 100
-		fmt.Printf("║    Improvement: %-46.2f%% ║\n", improvement)
+	if len(cachedResults) > 0 {
+		fmt.Printf("║    Cached: %-52v ║\n", avgCachedUploadTime)
+		if avgCachedUploadTime > 0 {
+			improvement := float64(cleanResult.UploadPhase.WallTime-avgCachedUploadTime) / float64(cleanResult.UploadPhase.WallTime) * 100
+			fmt.Printf("║    Improvement: %-46.2f%% ║\n", improvement)
+		}
+	} else {
+		fmt.Printf("║    Cached: %-52s ║\n", "N/A")
 	}
 
 	fmt.Printf("║                                                                ║\n")
@@ -490,7 +521,11 @@ func (tr *TestRunner) compareCleanVsCached() {
 	fmt.Printf("║                                                                ║\n")
 	fmt.Printf("║  Bytes Uploaded:                                                ║\n")
 	fmt.Printf("║    Clean:  %-52d (%.2f MB) ║\n", cleanResult.UploadPhase.BytesUploaded, float64(cleanResult.UploadPhase.BytesUploaded)/(1024*1024))
-	fmt.Printf("║    Cached: %-52d (%.2f MB) ║\n", avgCachedBytes, float64(avgCachedBytes)/(1024*1024))
+	if len(cachedResults) > 0 {
+		fmt.Printf("║    Cached: %-52d (%.2f MB) ║\n", avgCachedBytes, float64(avgCachedBytes)/(1024*1024))
+	} else {
+		fmt.Printf("║    Cached: %-52s ║\n", "N/A")
+	}
 	fmt.Printf("╚═══════════════════════════════════════════════════════════════╝\n")
 }
 
